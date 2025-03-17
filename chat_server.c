@@ -1,84 +1,81 @@
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+
+#include <netinet/in.h>
+
+#include <string.h>
+
 #include <unistd.h>
 
-#define MAX_CLIENTS 1024
-#define BUFFER_SIZE 4096
+int g_max_fd;
+int g_id = 0;
+char g_buf[400000];
+
+fd_set g_read_set, g_write_set;
 
 typedef struct s_client {
-  int fd;
   int id;
+  char *buf;
 } t_client;
 
-typedef struct {
-  t_client clients[MAX_CLIENTS];
-  int server_fd;
-  int max_fd;
-} server_state;
+int extract_message(char **buf, char **msg) {
+  char *newbuf;
+  int i;
 
-// Função 1: Configuração inicial do servidor
-int setup_server(int port) {
-  int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  struct sockaddr_in addr = {.sin_family = AF_INET,
-                             .sin_addr.s_addr = INADDR_ANY,
-                             .sin_port = htons(port)};
-
-  if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("bind failed");
-    exit(EXIT_FAILURE);
-  }
-
-  if (listen(server_fd, 10) < 0) {
-    perror("listen failed");
-    exit(EXIT_FAILURE);
-  }
-  return server_fd;
-}
-
-// Função 2: Aceitar nova conexão
-void accept_connection(server_state *state) {
-  int client_fd = accept(state->server_fd, NULL, NULL);
-  if (client_fd < 0)
-    return;
-
-  for (int i = 0; i < MAX_CLIENTS; i++) {
-    if (state->clients[i].fd == 0) {
-      state->clients[i].fd = client_fd;
-      state->clients[i].id = i;
-      dprintf(client_fd, "Welcome! Your ID: %d\n", i);
-      printf("Client %d connected\n", i);
-      return;
+  *msg = 0;
+  if (*buf == 0)
+    return (0);
+  i = 0;
+  while ((*buf)[i]) {
+    if ((*buf)[i] == '\n') {
+      newbuf = calloc(1, sizeof(*newbuf) * (strlen(*buf + i + 1) + 1));
+      if (newbuf == 0)
+        return (-1);
+      strcpy(newbuf, *buf + i + 1);
+      *msg = *buf;
+      (*msg)[i + 1] = 0;
+      *buf = newbuf;
+      return (1);
     }
+    i++;
   }
-  close(client_fd);
-  printf("Server full! Rejected connection\n");
+  return (0);
 }
 
-// Função 3: Processar mensagem do cliente
-void handle_client(server_state *state, int client_index) {
-  char buffer[BUFFER_SIZE];
-  t_client *client = &state->clients[client_index];
+char *str_join(char *buf, char *add) {
+  char *newbuf;
+  int len;
 
-  int bytes = recv(client->fd, buffer, BUFFER_SIZE - 1, 0);
-  if (bytes <= 0) {
-    printf("Client %d disconnected\n", client->id);
-    close(client->fd);
-    client->fd = 0;
-    return;
-  }
+  if (buf == 0)
+    len = 0;
+  else
+    len = strlen(buf);
+  newbuf = malloc(sizeof(*newbuf) * (len + strlen(add) + 1));
+  if (newbuf == 0)
+    return (0);
+  newbuf[0] = 0;
+  if (buf != 0)
+    strcat(newbuf, buf);
+  free(buf);
+  strcat(newbuf, add);
+  return (newbuf);
+}
 
-  buffer[bytes] = '\0';
-  char msg[BUFFER_SIZE + 20];
-  snprintf(msg, sizeof(msg), "Client %d: %s", client->id, buffer);
+void err(const char *msg) {
+  write(STDERR_FILENO, msg, strlen(msg));
+  exit(EXIT_FAILURE);
+}
 
-  // Função 4: Broadcast
-  for (int j = 0; j < MAX_CLIENTS; j++) {
-    if (state->clients[j].fd > 0 && j != client_index) {
-      send(state->clients[j].fd, msg, strlen(msg), 0);
+void broadcast(t_client *clients, char *msg, int exclude_fd) {
+  for (int fd = 0; fd < 1024; fd++) {
+    if (clients[fd].id != -1 && fd != exclude_fd) {
+      if (FD_ISSET(fd, &g_write_set)) {
+        send(fd, msg, strlen(msg), MSG_NOSIGNAL);
+      }
     }
   }
 }
@@ -86,50 +83,90 @@ void handle_client(server_state *state, int client_index) {
 // Função principal
 int main(int argc, char **argv) {
   if (argc != 2) {
-    fprintf(stderr, "Usage: %s <port>\n", argv[0]);
-    exit(EXIT_FAILURE);
+    err("Wrong number of arguments\n");
   }
 
-  server_state state = {0};
-  state.server_fd = setup_server(atoi(argv[1]));
-  state.max_fd = state.server_fd;
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd == -1) {
+    err("Fatal error\n");
+  }
 
-  printf("Server running on port %s\n", argv[1]);
+  struct sockaddr_in sockaddr;
+  bzero(&sockaddr, sizeof(sockaddr));
 
-  fd_set read_fds;
+  sockaddr.sin_family = AF_INET;
+  sockaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  sockaddr.sin_port = htons(atoi(argv[1]));
+
+  if (bind(sockfd, (const struct sockaddr *)&sockaddr, sizeof(sockaddr)) != 0) {
+    err("Fatal error\n");
+  }
+  if (listen(sockfd, 10) != 0) {
+    err("Fatal error\n");
+  }
+
+  // Init clients array
+  t_client clients[1024];
+  for (int fd; fd < 1024; fd++) {
+    clients[fd].id = -1;
+    clients[fd].buf = NULL;
+  }
+
   while (1) {
-    FD_ZERO(&read_fds);
-    FD_SET(state.server_fd, &read_fds);
-    state.max_fd = state.server_fd;
+    FD_ZERO(&g_read_set);
+    FD_ZERO(&g_write_set);
 
-    // Configurar file descriptors
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-      if (state.clients[i].fd > 0) {
-        FD_SET(state.clients[i].fd, &read_fds);
-        if (state.clients[i].fd > state.max_fd)
-          state.max_fd = state.clients[i].fd;
+    FD_SET(sockfd, &g_read_set);
+    g_max_fd = sockfd;
+    for (int fd = 0; fd < 1024; fd++) {
+      if (clients[fd].id != -1) {
+        FD_SET(fd, &g_read_set);
+        FD_SET(fd, &g_write_set);
+        g_max_fd = fd;
       }
     }
 
-    // Esperar por atividade
-    if (select(state.max_fd + 1, &read_fds, NULL, NULL, NULL) < 0) {
-      perror("select error");
-      exit(EXIT_FAILURE);
+    if (select(g_max_fd + 1, &g_read_set, &g_write_set, NULL, NULL) == -1) {
+      err("Fatal error\n");
     }
 
-    // Nova conexão
-    if (FD_ISSET(state.server_fd, &read_fds)) {
-      accept_connection(&state);
-    }
-
-    // Verificar clientes
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-      if (state.clients[i].fd > 0 && FD_ISSET(state.clients[i].fd, &read_fds)) {
-        handle_client(&state, i);
+    // Handle new connection
+    if (FD_ISSET(sockfd, &g_read_set)) {
+      int fd = accept(sockfd, NULL, NULL);
+      if (fd == -1) {
+        err("Fatal error\n");
       }
+      clients[fd].id = g_id++;
+      sprintf(g_buf, "server: client %d just arrived\n", clients[fd].id);
+      broadcast(clients, g_buf, fd);
+    }
+
+    // Handle socket read and write events
+    for (int fd = 0; fd < 1024; fd++) {
+
+      if (clients[fd].id != -1 && FD_ISSET(fd, &g_read_set)) {
+        int bytes = recv(fd, g_buf, sizeof(g_buf), 0);
+        if (bytes <= 0) {
+          sprintf(g_buf, "server: client %d just left\n", clients[fd].id);
+          broadcast(clients, g_buf, fd);
+          clients[fd].id = -1;
+          close(fd);
+        } else {
+          g_buf[bytes] = '\0';
+          clients[fd].buf = str_join(clients[fd].buf, g_buf);
+          char *msg;
+          while (extract_message(&clients[fd].buf, &msg) == 1) {
+            sprintf(g_buf, "client %d: %s", clients[fd].id, msg);
+            broadcast(clients, g_buf, fd);
+            free(msg);
+            if (clients[fd].buf[0] == '\0') {
+              free(clients[fd].buf);
+              clients[fd].buf = NULL;
+            }
+          }
+        }
+      }
+
     }
   }
-
-  close(state.server_fd);
-  return 0;
 }
